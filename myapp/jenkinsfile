@@ -1,0 +1,136 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "manishakhatri23/myapp:latest"
+        TRIVY_IMAGE = "aquasec/trivy:0.41.0"
+        TRIVY_CACHE = "$WORKSPACE/trivy-cache"
+        K8S_PATH = "./myapp/kubernetes"
+    }
+
+    stages {
+
+        stage('Debug') {
+            steps {
+                sh 'whoami'
+                sh 'docker --version'
+                sh 'docker ps'
+            }
+        }
+
+        stage('Clone Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Manishakhatri23/docker-kubernetes-secure-app.git'
+            }
+        }
+
+        stage('Check Files') {
+            steps {
+                sh 'pwd'
+                sh 'ls -l'
+                sh 'find . -name Dockerfile'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t myapp:latest ./myapp'
+            }
+        }
+
+        stage('Docker Hub Login & Push') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-id', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh '''
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        docker tag myapp:latest $IMAGE_NAME
+                        docker push $IMAGE_NAME
+                    '''
+                }
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                script {
+                    sh "mkdir -p $TRIVY_CACHE"
+
+                    sh """
+                        docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v $TRIVY_CACHE:/root/.cache/ \
+                        $TRIVY_IMAGE image \
+                        --severity HIGH,CRITICAL \
+                        --format table \
+                        $IMAGE_NAME > trivy-report.txt || true
+                    """
+
+                    archiveArtifacts artifacts: 'trivy-report.txt', allowEmptyArchive: true
+                    echo "✅ Trivy scan completed. Check 'trivy-report.txt'."
+
+                    def reportContent = readFile('trivy-report.txt')
+                    if (reportContent.contains("CRITICAL") || reportContent.contains("HIGH")) {
+                        echo "⚠️ High/Critical vulnerabilities detected. Check trivy-report.txt"
+                    } else {
+                        echo "No HIGH/CRITICAL vulnerabilities found."
+                    }
+                }
+            }
+        }
+
+        stage('Run Docker Container') {
+            steps {
+                sh '''
+                    if [ $(docker ps -q -f name=myapp_container) ]; then
+                        docker stop myapp_container
+                        docker rm myapp_container
+                    fi
+                    HOST_PORT=$(shuf -i 3000-3999 -n 1)
+                    echo "Running container on host port $HOST_PORT"
+                    docker run -d --name myapp_container -p $HOST_PORT:3000 myapp:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    // Apply deployment.yaml if exists
+                    if (fileExists("${K8S_PATH}/deployment.yaml")) {
+                        echo "✅ deployment.yaml found. Applying..."
+                        sh """
+                            docker run --rm \
+                            -v $HOME/.kube:/root/.kube \
+                            -v \$(pwd)/${K8S_PATH}:/app \
+                            bitnami/kubectl apply -f /app/deployment.yaml --validate=false || echo "⚠️ deployment.yaml apply failed, skipping."
+                        """
+                    } else {
+                        echo "ℹ️ deployment.yaml not found. Skipping."
+                    }
+
+                    // Apply service.yaml if exists
+                    if (fileExists("${K8S_PATH}/service.yaml")) {
+                        echo "✅ service.yaml found. Applying..."
+                        sh """
+                            docker run --rm \
+                            -v $HOME/.kube:/root/.kube \
+                            -v \$(pwd)/${K8S_PATH}:/app \
+                            bitnami/kubectl apply -f /app/service.yaml --validate=false || echo "⚠️ service.yaml apply failed, skipping."
+                        """
+                    } else {
+                        echo "ℹ️ service.yaml not found. Skipping."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Pipeline succeeded!"
+        }
+        failure {
+            echo "❌ Pipeline failed! But Kubernetes errors are skipped safely."
+        }
+    }
+}
